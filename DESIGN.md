@@ -190,7 +190,7 @@ Turns a chosen `Slot` into a URL that opens OpenTable's confirm/booking page wit
 
 Complete these before implementation starts. Steps 1–3 are hard blockers for M1.
 
-**Provisioning status:** `LLM_API_KEY` (Groq), `SENDBLUE_API_KEY`, `SENDBLUE_API_SECRET`, and `ALLOWLISTED_PHONE` are provisioned as repo-scoped Devin secrets — they are never committed; `.env.example` lists the names only. Still outstanding: the dedicated Sendblue sending number (`SENDBLUE_FROM_NUMBER`), the Sendblue inbound webhook URL, and `WEBHOOK_SHARED_SECRET`.
+**Provisioning status:** `LLM_API_KEY` (Groq), `SENDBLUE_API_KEY`, `SENDBLUE_API_SECRET`, and `ALLOWLISTED_PHONE` are stored as Devin secrets — they are never committed; `.env.example` lists the names only. The dedicated Sendblue sending number is `+18722964991` (not secret, checked into `.env.example`). Still outstanding: the Sendblue inbound webhook URL (set once ngrok or a deployment is up) and `WEBHOOK_SHARED_SECRET`.
 
 1. **Groq (LLM)**
    - Create an account at <https://console.groq.com>.
