@@ -64,12 +64,17 @@ flowchart LR
     U["User (iMessage)"] --> GW["iMessage Gateway (hosted provider: Sendblue)"]
     GW --> API["FastAPI app: POST /webhook/imessage"]
     API --> CORE["Agent Core (LLM + tool calling)"]
-    CORE --> AVAIL["Availability Service (OpenTable internal endpoint + Playwright fallback)"]
+    CORE --> AVAIL["Availability Service (ranking, cache, retry)"]
     CORE --> LINK["Booking Link Builder"]
     CORE --> JOBS["Jobs Store (SQLite)"]
     CORE --> OUT["MessagingClient (outbound send)"]
     OUT --> GW
-    AVAIL --> OT["OpenTable"]
+    AVAIL --> CB["Cloud Browser (Browserbase/Steel, Playwright over CDP)"]
+    AVAIL --> FAST["httpx replay with cached Akamai clearance cookies"]
+    CB --> OT["OpenTable"]
+    FAST --> OT
+    CB --> COOKIES["Clearance cookie cache"]
+    COOKIES --> FAST
     SCHED["Scheduler (APScheduler, daily 9:00 AM PST)"] --> JOBS
     SCHED --> CORE
     CONV["Conversation Store (SQLite transcript)"] --> CORE
@@ -85,6 +90,7 @@ sequenceDiagram
     participant API as "FastAPI Webhook"
     participant AG as "Agent Core (LLM)"
     participant AV as "Availability Service"
+    participant CB as "Cloud Browser"
     participant OT as "OpenTable"
     participant BL as "Booking Link Builder"
 
@@ -92,8 +98,10 @@ sequenceDiagram
     GW->>API: "POST /webhook/imessage"
     API->>AG: "inbound message + transcript"
     AG->>AV: "check_availability(rid, date, party_size, window)"
-    AV->>OT: "GET internal availability endpoint"
-    OT-->>AV: "slot list"
+    AV->>CB: "open restaurant page for date and party size"
+    CB->>OT: "page load plus OpenTable's own availability call"
+    OT-->>CB: "availability JSON (captured in session)"
+    CB-->>AV: "slots plus clearance cookies for later replay"
     AV-->>AG: "normalized, ranked slots"
     AG-->>GW: "best-fit openings (7:15pm, 7:45pm, 9:15pm*)"
     GW-->>U: "iMessage reply"
@@ -140,17 +148,35 @@ Tools exposed to the model:
 
 The system prompt carries: today's date and timezone (`America/Los_Angeles`), the configured restaurant list, the time-window ranking semantics, the pre-filled-link (not auto-book) policy, and SMS-appropriate formatting rules (short, no markdown).
 
-### (c) Availability Service — OpenTable lookups
+### (c) Availability Service — OpenTable lookups via a cloud browser
 
-- Primary path: OpenTable's **internal HTTP availability endpoint**, called with `httpx` (async), keyed by the restaurant's `rid`. Request carries date, party size, and a time anchor; response is normalized into:
+**Revised after live testing.** OpenTable fronts its site with Akamai, which blocks datacenter IPs outright: plain `httpx`, browser-like headers, and a real Chrome running on our VM all receive the same `Access Denied` edge response for both restaurants. Calling the internal endpoint directly from our own infrastructure is therefore not viable, and the browser is not a fallback — it is the way in.
+
+The design is a **cloud browser** (Browserbase or Steel — real Chrome on residential-grade IPs with anti-bot handling, driven by Playwright over CDP), used in two escalating modes:
+
+**Mode 1 — network capture (preferred).** Drive the restaurant page for a given date/party size and let OpenTable's own JavaScript make its availability call; we intercept the response inside the browser session:
+
+```
+page.on("response", lambda r: capture(r) if "/dapi/fe/gql" in r.url and "Availability" in r.url else None)
+page.goto(f"https://www.opentable.com/r/{slug}?covers={party_size}&dateTime={iso}")
+slots = normalize(captured_json)
+```
+
+This yields structured slot objects — including the slot hash the confirm URL needs — instead of scraped text, and never depends on DOM class names.
+
+**Mode 2 — DOM scrape (backstop).** If the payload shape changes, read the rendered slot buttons and their `href`s. Slower and more brittle, but it also surfaces the confirm URL directly.
+
+**Session/cookie reuse (the optimization that makes this affordable).** Once a browser session has passed Akamai it holds valid `_abck` / `bm_sz` clearance cookies. We export them plus the exact request signature and replay subsequent lookups with `httpx` from our own process — sub-second and free — falling back to a fresh browser session when a replayed call returns 403 (cookies expired, typically tens of minutes). Steady state is roughly one browser session per cookie lifetime rather than one per query.
+
+Either way the result normalizes to:
 
 ```
 Slot(rid, restaurant_name, datetime_local, party_size, slot_token, source)
 ```
 
-- Sends realistic headers, a modest per-restaurant rate limit, retries with jitter on 429/5xx, and a short response cache (single-digit minutes) so repeated turns in one conversation do not re-hit OpenTable.
-- **Playwright fallback**: if the internal endpoint changes shape, returns a challenge, or fails repeatedly, the service falls back to driving the public OpenTable restaurant page headlessly and scraping rendered slot buttons (which also yields the confirm URL directly). Slower, used only as a backstop, behind a feature flag.
-- Ranking is applied here: slots strictly inside the requested window first (ordered by proximity to the window's midpoint or to a stated preferred time), then edge fallbacks (see §5).
+All of this sits behind the `AvailabilityProvider` protocol (`async def fetch(rid, day, party_size) -> list[Slot]`), so the provider is a config switch: `cloud_browser` in real use, `mock` for tests and offline development. Around it the service adds retry with jitter, a per-restaurant rate limit, and a short response cache so repeated conversational turns do not re-hit OpenTable.
+
+Ranking is applied here: slots strictly inside the requested window first (ordered by proximity to the window's midpoint or to a stated preferred time), then edge fallbacks (see §5).
 
 ### (d) Booking Link Builder
 
@@ -176,7 +202,7 @@ Turns a chosen `Slot` into a URL that opens OpenTable's confirm/booking page wit
 | # | Decision | Rationale | Trade-off / risk |
 | --- | --- | --- | --- |
 | 1 | Use a **hosted iMessage provider** (Sendblue default) behind a `MessagingClient` interface | Self-hosting iMessage needs a always-on Mac and is fragile; a hosted provider gets us a real blue-bubble number in hours | Paid, subject to provider ToS and rate limits; interface keeps swap cost low (LoopMessage stub already in place) |
-| 2 | Read availability from OpenTable's **internal HTTP endpoint** | Fast, structured JSON, no browser overhead | **Unofficial**: no stability guarantee, may violate OpenTable ToS, can break or start challenging requests without notice; Playwright fallback mitigates |
+| 2 | Read availability through a **hosted cloud browser** (Browserbase/Steel), capturing OpenTable's own availability JSON from inside the session, then replaying it with cached clearance cookies | Verified necessity: Akamai blocks this VM's IP for both plain HTTP and real Chrome, so only residential-grade browser infrastructure gets through. Network capture gives structured slots (incl. the slot hash) rather than scraped text; cookie reuse keeps the per-query cost near zero | Paid dependency (~$30-40/mo entry); a cold session costs 10-20s; still unofficial and subject to OpenTable ToS and payload changes; DOM scrape is the backstop |
 | 3 | **Single allowlisted phone number** | Prototype is for one user; removes auth, onboarding, and abuse surface | Anything from other numbers is dropped; multi-user is a roadmap item |
 | 4 | Return a **pre-filled booking link**, do not auto-book | Keeps a human in the loop for a financially/socially binding action; avoids automated-booking ToS exposure and no-show risk while the slot mapping is unproven | Extra tap for the user; a slot can be taken between reply and confirm. Auto-booking is a deliberate future phase |
 | 5 | **Hardcode Four Kings + Seven Hills in config**, but keep the path config-driven | Two restaurants is enough to prove the flow; `rid`s are discovered once and pinned | Adding a restaurant needs a config edit + `rid` lookup, not a code change |
@@ -210,7 +236,12 @@ Complete these before implementation starts. Steps 1–3 are hard blockers for M
    - Install ngrok and create an account/authtoken.
    - Run `ngrok http 8000` and set the Sendblue inbound webhook to `https://<subdomain>.ngrok.app/webhook/imessage` while developing locally. Re-point it at the deployed URL later.
 
-5. **OpenTable**
+5. **Cloud browser (Browserbase or Steel)** — required for any real availability
+   - Sign up at <https://www.browserbase.com> (~$39/mo entry) or <https://steel.dev> (free credits to start).
+   - Create an API key → `BROWSER_API_KEY`; set `BROWSER_PROVIDER` accordingly.
+   - Needed because OpenTable's edge blocks requests from our own infrastructure — see §4(c).
+
+6. **OpenTable**
    - **No account or API key needed.** Availability is read anonymously; booking is completed by the user on OpenTable via the pre-filled link. We only need each restaurant's `rid`, obtained once from its OpenTable page URL.
 
 ### Required `.env` variables
@@ -230,7 +261,10 @@ Complete these before implementation starts. Steps 1–3 are hard blockers for M
 | `TIMEZONE` | `America/Los_Angeles` | Interpretation of dates/times and cron |
 | `MONITOR_CRON_HOUR` | `9` | Daily monitoring run hour (local time) |
 | `RESTAURANTS_CONFIG` | `./restaurants.yaml` | Restaurant name → `rid` mapping (Four Kings, Seven Hills) |
-| `AVAILABILITY_FALLBACK_PLAYWRIGHT` | `true` | Enable the headless-browser fallback |
+| `AVAILABILITY_PROVIDER` | `cloud_browser` | `cloud_browser` \| `mock` |
+| `BROWSER_PROVIDER` | `browserbase` | `browserbase` \| `steel` |
+| `BROWSER_API_KEY` | `bb_...` | Cloud browser API key |
+| `AVAILABILITY_DOM_FALLBACK` | `true` | Fall back to DOM scraping if network capture yields nothing |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
 ---
@@ -238,7 +272,7 @@ Complete these before implementation starts. Steps 1–3 are hard blockers for M
 ## 7. Key risks
 
 1. **iMessage provider ToS and rate limits.** Hosted iMessage providers sit in a grey area with Apple; accounts and numbers can be throttled or suspended, and per-minute send limits apply. Mitigation: the `MessagingClient` interface (LoopMessage stub ready), conservative send rates, no unsolicited messaging beyond the user's own monitors.
-2. **OpenTable anti-scraping / ToS and internal-endpoint fragility.** The availability endpoint is unofficial and undocumented: shape changes, bot challenges, or IP blocks can break the agent at any time, and automated access may conflict with OpenTable's terms. Mitigation: low request volume, caching, realistic headers, Playwright fallback, and clear failure messages to the user rather than silent wrong answers.
+2. **OpenTable anti-scraping / ToS — confirmed, not hypothetical.** Akamai already blocks our infrastructure; we are relying on a cloud browser with residential-grade IPs to get through, and OpenTable can tighten this further at any time (harder challenges, blocking the provider's ranges). Automated access may also conflict with OpenTable's terms. Mitigation: low request volume, aggressive caching and cookie reuse, DOM fallback, clear failure messages to the user rather than silent wrong answers, and a `mock` provider so development never depends on the live path.
 3. **Booking-link slot → confirm-URL mapping must be validated live.** The pre-filled link is the product's payoff; if the parameter set (especially any slot token/hash) is wrong or expires quickly, the user lands on a generic page or an error. Mitigation: validate against real slots at both restaurants early in M1, keep the builder isolated and covered by a live smoke check, and include date/time/party size in the reply text so the user can recover manually.
 
 Secondary risks: LLM tool-calling misfires (wrong date or party size) — mitigated by echoing parsed criteria back in the reply; slots taken between reply and confirm — inherent to the link flow; single-process SQLite deployment — acceptable at prototype scale.
