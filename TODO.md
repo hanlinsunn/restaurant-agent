@@ -20,20 +20,30 @@ Testing layers used throughout:
 - [ ] **0.3 Restaurant config.** `restaurants.yaml` with Four Kings and Seven Hills: display name, aliases, OpenTable `rid`, timezone. `rid`s discovered from each restaurant's OpenTable URL.
   - **Verify:** unit test loads the file and resolves "four kings", "Four Kings SF", "seven hills" to the right `rid`s.
 
-## Phase 1 — Availability Service (build before the agent; it's the riskiest piece)
+## Phase 1 — Availability via a cloud browser (build before the agent; it's the riskiest piece)
 
-- [ ] **1.1 Reverse-engineer OpenTable's internal availability endpoint.** Capture the request the OpenTable restaurant page makes (headers, payload, auth/anon token) for a given `rid`, date, and party size. Record real responses as fixtures.
-  - **Verify:** a live script prints real slots for Four Kings for a date known to have availability; results eyeballed against the OpenTable website for the same date/party size.
-- [ ] **1.2 Implement `AvailabilityService.check(rid, date, party_size)`** with `httpx` async, normalizing responses to `Slot(rid, restaurant_name, datetime_local, party_size, slot_token, source)`. Include retries with jitter, per-restaurant rate limiting, and a short TTL cache.
-  - **Verify:** unit tests against recorded fixtures cover normal, empty, and malformed responses; a live run against both restaurants returns slots matching the website.
-- [ ] **1.3 Window ranking.** Slots inside the requested window ranked first (by proximity to window midpoint / stated preferred time); slots within 30 minutes of either edge included as flagged fallbacks; everything else dropped.
+**Why this shape:** OpenTable's Akamai edge blocks this VM's IP for plain HTTP *and* for real Chrome running locally (verified against both restaurants). The live browser is the primary path, not a fallback — but it must originate from residential-grade IPs, i.e. a hosted cloud browser.
+
+- [x] **1.0 Confirm the block and pick the approach.** Tested `httpx`, browser-like headers, local Chrome, and a server-side fetch API. Local paths return Akamai `Access Denied`; a third-party server-side fetch reached one restaurant but not the other, and exposed no slot data.
+  - **Verified:** screenshots of `Access Denied` for both restaurants from local Chrome.
+- [ ] **1.1 Stand up a cloud browser session.** Sign up for Browserbase (or Steel), store `BROWSER_API_KEY`, connect Playwright over CDP: `chromium.connect_over_cdp(session.connect_url)`, reusing `browser.contexts[0].pages[0]`.
+  - **Verify:** a script loads the Four Kings OpenTable page through the cloud browser and prints the page title — i.e. no `Access Denied`. This is the go/no-go gate for the whole approach; if it fails, try the other provider and enable its stealth/proxy options before anything else.
+- [ ] **1.2 Capture OpenTable's own availability call (Mode 1).** Attach a `page.on("response")` listener filtering for the availability GraphQL operation, navigate to the restaurant page with date/party size in the query string, and record the raw JSON as a fixture.
+  - **Verify:** captured JSON contains slot times and a slot hash for a date with known availability; times match what the website shows for the same date/party size.
+- [ ] **1.3 `CloudBrowserProvider.fetch(rid, day, party_size)`** normalizing the captured payload to `Slot(...)`, implementing the `AvailabilityProvider` protocol.
+  - **Verify:** unit tests against the recorded fixture (normal / empty / malformed); a live run returns slots for both restaurants matching the website.
+- [ ] **1.4 DOM scrape backstop (Mode 2).** If no availability response is captured, read the rendered slot buttons and their `href`s in the same session. Behind `AVAILABILITY_DOM_FALLBACK`.
+  - **Verify:** disable network capture and confirm the scrape returns the same slot times as Mode 1 for the same date.
+- [ ] **1.5 Clearance-cookie reuse.** Export the session's Akamai cookies (`_abck`, `bm_sz`, …) plus the request signature; replay subsequent lookups with `httpx` from our own process, and fall back to a fresh browser session on 403.
+  - **Verify:** after one browser session, three consecutive `httpx` lookups succeed in under a second each; artificially expiring the cookies triggers exactly one new browser session, and no request loop.
+- [ ] **1.6 Window ranking.** Slots inside the requested window ranked first (by proximity to window midpoint / stated preferred time); slots within 30 minutes of either edge included as flagged fallbacks; everything else dropped.
   - **Verify:** table-driven unit tests — window 7–9pm with candidate slots at 6:25/6:35/7:15/8:45/9:20/9:45 yields exactly `[7:15, 8:45]` in-window and `[6:35, 9:20]` as flagged fallbacks, in that rank order.
-- [ ] **1.4 Playwright fallback.** Headless load of the restaurant page, scrape rendered slot buttons and their confirm URLs. Behind `AVAILABILITY_FALLBACK_PLAYWRIGHT`; used on repeated primary failure.
-  - **Verify:** force the primary path to fail and confirm the fallback returns slots for the same date that agree with the primary path's output.
+- [ ] **1.7 Cost and rate control.** Cache responses for a few minutes, one in-flight lookup per restaurant, and a hard cap on browser sessions per hour.
+  - **Verify:** two identical lookups in quick succession create only one browser session; log line reports sessions used per lookup.
 
 ## Phase 2 — Booking Link Builder
 
-- [ ] **2.1 Determine the real confirm-URL shape.** Click through a real booking on OpenTable up to (not through) the confirm step and record the URL and which params are required — especially any slot token/hash and its expiry.
+- [ ] **2.1 Determine the real confirm-URL shape.** In the cloud browser, click a real slot up to (not through) the confirm step and record the resulting URL and which params are required — especially any slot token/hash and its expiry. The slot `href` captured in 1.4 is the primary evidence.
   - **Verify:** documented in `DESIGN.md`; a manually constructed URL opens the confirm page pre-filled with the right restaurant, date, time, and party size.
 - [ ] **2.2 Implement `build_booking_link(slot)`.**
   - **Verify:** unit tests on URL construction; **live check** — build links for 3 real slots across both restaurants, open each, confirm all fields are pre-filled and no error page. This is the single most important check in M1.
@@ -101,12 +111,13 @@ Testing layers used throughout:
 
 | Item | Needed for | Status |
 | --- | --- | --- |
+| **Cloud browser account + API key** (Browserbase ~$39/mo, or Steel free tier to start) | all of Phase 1 | **Blocking** — hard gate on real availability |
 | Sendblue inbound webhook URL set to the ngrok URL + `/webhook/imessage` | 3.2 onward | Blocked until the app runs; I'll supply the URL |
 | Sendblue billing active | any real send | Please confirm |
 | Static ngrok domain (optional) | stable webhook URL | Optional, recommended |
 
 ## Known risks carried from DESIGN.md
 
-1. The OpenTable internal endpoint is unofficial — items 1.1–1.2 may force us onto the Playwright fallback sooner than planned.
+1. OpenTable's protection is confirmed hostile to our infrastructure. Item 1.1 is a genuine go/no-go: if neither cloud browser provider gets through, the remaining options are running lookups from a residential IP or dropping to opening-hours data, both of which change the product.
 2. The confirm-URL slot token (2.1) may be short-lived, which would make links expire; if so we surface the slot details in the text so the user can still book manually.
 3. Sendblue rate limits / ToS — keep test-send volume low during E2E runs.
